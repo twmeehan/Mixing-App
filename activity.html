@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Guess the Number</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Tailwind for quick styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React + ReactDOM + Babel (for JSX in-browser while prototyping) -->
+    <script
+      src="https://unpkg.com/react@18/umd/react.development.js"
+      crossorigin
+    ></script>
+    <script
+      src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"
+      crossorigin
+    ></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body class="bg-neutral-950 text-neutral-100">
+    <div id="root" class="h-full"></div>
+
+    <!-- Your React game code lives in this external file -->
+    <script type="text/babel" src="./src/GuessFrequencyEasy.jsx"></script>
+
+    <noscript>Please enable JavaScript to play.</noscript>
+  </body>
+</html>
