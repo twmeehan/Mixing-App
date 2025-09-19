@@ -1,64 +1,159 @@
-import os, random
-from backend.utils.equalization import apply_peq
-from flask import Flask, Response, stream_with_context, request
+import os, glob, base64, mimetypes, random, threading
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import subprocess
+
+from utils.eq_file_factory import bounce_eq
 
 app = Flask(__name__)
 CORS(app)
 
+# --------------------------------------------------------------------
+# Server-side ranges (moved from client)
+# Edit/extend here; labels are what the client will display.
+# --------------------------------------------------------------------
+RANGES = [
+    {"label": "20 – 120",   "min": 20,   "max": 120},
+    {"label": "121 – 500",  "min": 121,  "max": 500},
+    {"label": "501 – 800",  "min": 501,  "max": 800},
+    {"label": "801 – 4000", "min": 801,  "max": 4000},
+    {"label": "4001+",      "min": 4001, "max": 8000},
+]
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SOUNDS_DIR = os.path.join(BASE_DIR, "sounds")
 
-AUDIO_FILES = [
-    os.path.join(SOUNDS_DIR, "serverloop1.wav"),
-    os.path.join(SOUNDS_DIR, "serverloop2.wav"),
-    os.path.join(SOUNDS_DIR, "serverloop3.wav"),
-]
+AUDIO_FILES = sorted(
+    glob.glob(os.path.join(SOUNDS_DIR, "*.wav")) +
+    glob.glob(os.path.join(SOUNDS_DIR, "*.mp3"))
+)
 
-@app.get("/")
-def index():
-    return """
-<!doctype html>
-<title>Audio Stream</title>
-<audio id="player" controls autoplay src="/stream?version=orig"></audio>
-<button onclick="toggle()">Toggle</button>
-<script>
-let toggled = false;
-function toggle() {
-  const player = document.getElementById("player");
-  toggled = !toggled;
-  // add cache-buster so browser reloads the stream
-  player.src = toggled ? "/stream?version=edited&rand=" + Math.random()
-                       : "/stream?version=orig&rand=" + Math.random();
-  player.load();
-  player.play();
-}
-</script>
-"""
+# --------------------------------------------------------------------
+# Game state (simple single-session storage)
+# --------------------------------------------------------------------
+_state_lock = threading.Lock()
+CURRENT_TARGET_HZ: float | None = None
+CURRENT_RANGE_INDEX: int | None = None
 
-@app.get("/stream")
-def stream():
-    version = request.args.get("version", "orig")
-    chosen = AUDIO_FILES[0]
+def _set_target(freq_hz: float, range_idx: int):
+    global CURRENT_TARGET_HZ, CURRENT_RANGE_INDEX
+    with _state_lock:
+        CURRENT_TARGET_HZ = float(freq_hz)
+        CURRENT_RANGE_INDEX = int(range_idx)
 
-    def generate(path, edited=False):
-        if not edited:
-            # Just stream the file as-is
-            with open(path, "rb") as f:
-                while chunk := f.read(8192):
-                    yield chunk
+def _get_target():
+    with _state_lock:
+        return CURRENT_TARGET_HZ, CURRENT_RANGE_INDEX
+
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+def _b64(b: bytes) -> str:
+    import base64
+    return base64.b64encode(b).decode("ascii")
+
+# --------------------------------------------------------------------
+# API
+# --------------------------------------------------------------------
+@app.get("/audio-bundle")
+def audio_bundle():
+    """
+    Picks a random source file, then:
+      1) Picks a random RANGE first
+      2) Picks a random frequency inside that interval
+      3) Bounces EQ at that frequency (Q, gain set in the factory)
+      4) Returns original file (as-is) + EQ version (as WAV)
+      5) Returns the ranges list for the client to render
+    """
+    if not AUDIO_FILES:
+        return jsonify({"error": "No audio files found"}), 404
+
+    # choose a source file
+    src_path = random.choice(AUDIO_FILES)
+    orig_bytes = _read_bytes(src_path)
+    mime, _ = mimetypes.guess_type(src_path)
+    mime = mime or "application/octet-stream"
+
+    # choose a range, then a frequency inside it
+    range_idx = random.randrange(len(RANGES))
+    r = RANGES[range_idx]
+    # for the open-ended "4001+" we cap the upper bound for the game logic
+    r_min = int(r["min"])
+    r_max = int(r.get("max", 8000))  # default cap if missing
+    target_hz = random.uniform(r_min, r_max)
+
+    # store the target for /guess
+    _set_target(target_hz, range_idx)
+
+    # render EQ’d version at that target frequency (don’t leak f0 to client)
+    eq_wav_bytes, eq_meta = bounce_eq(src_path, f0_hz=target_hz)
+
+    # redact the exact frequency so the client can't trivially peek
+    if "eq_params" in eq_meta:
+        eq_meta = {k: v for k, v in eq_meta.items() if k != "eq_params"}
+
+    payload = {
+        "original": {
+            "filename": os.path.basename(src_path),
+            "mime": mime,
+            "encoding": "base64",
+            "data": _b64(orig_bytes),
+        },
+        "eq_version": {
+            "filename": eq_meta["filename"],  # "<orig>__eq.wav"
+            "mime": eq_meta["mime"],          # "audio/wav"
+            "encoding": "base64",
+            "data": _b64(eq_wav_bytes),
+        },
+        # Send server-side ranges so the client can render from source of truth
+        "ranges": RANGES,
+    }
+    return jsonify(payload)
+
+
+@app.get("/guess")
+def handle_guess():
+    """
+    Query params: ?min=<int>&max=<int>
+    Returns:
+      {
+        "correct": true/false,
+        "relation": "higher" | "lower" | null
+      }
+    - relation indicates where the true frequency lies relative to the GUESS RANGE
+      if incorrect (e.g., "higher" means target > max, "lower" means target < min).
+    - 404 if no active target (call /audio-bundle first).
+    """
+    target_hz, _range_idx = _get_target()
+    if target_hz is None:
+        return jsonify({"error": "No active game; call /audio-bundle first."}), 404
+
+    # validate inputs
+    try:
+        min_q = int(request.args.get("min", "").strip())
+        max_q_raw = request.args.get("max", "").strip()
+        # allow open-ended "plus" ranges by treating missing/blank max as a cap
+        if max_q_raw == "" or max_q_raw is None:
+            max_q = 10_000  # generous ceiling for "4001+"
         else:
-            # Edited version: apply obvious highpass filter
-            with open(path, "rb") as f:
-                while chunk := apply_peq(f.read(8192),f0=500,Q=1,gain_db=15):
-                    yield chunk
+            max_q = int(max_q_raw)
+    except Exception:
+        return jsonify({"error": "Bad query. Use ?min=<int>&max=<int>"}), 400
 
-    edited = (version == "edited")
-    resp = Response(stream_with_context(generate(chosen, edited=edited)), mimetype="audio/wav")
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Accept-Ranges"] = "bytes"
-    return resp
+    if min_q > max_q:
+        min_q, max_q = max_q, min_q  # normalize just in case
+
+    correct = (min_q <= target_hz <= max_q)
+    if correct:
+        relation = None
+    else:
+        relation = "lower" if target_hz < min_q else "higher"
+
+    return jsonify({"correct": correct, "relation": relation})
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)

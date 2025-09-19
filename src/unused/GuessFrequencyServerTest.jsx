@@ -12,67 +12,89 @@ function GuessNumberGame() {
   ];
 
   const audioRef = useRef(null);
+  const origSrcRef = useRef(null);
+  const eqSrcRef = useRef(null);
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [eqEnabled, setEqEnabled] = useState(true);
   const [attempts, setAttempts] = useState(0);
   const [hint, setHint] = useState("");
 
-  const once = (el, ev) =>
-    new Promise((res) => el.addEventListener(ev, res, { once: true }));
-
-  // Build URLs for different endpoints
-  const buildStreamSrc = ({ eq, randomize }) => {
-    const p = new URLSearchParams({
-      eq: eq ? "on" : "off",
-      randomize: randomize ? "1" : "0",
-      v: Date.now().toString(), // cache-bust
-    });
-    return `${API_BASE}/stream?${p.toString()}`;
+  
+  const makeUrlFromB64 = (b64, mime) => {
+    const bin = atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: mime || "application/octet-stream" }));
   };
-  const buildToggleSrc = () => `${API_BASE}/toggle-eq`;
 
-  // New round: /stream randomizes target
+  const revokeIfSet = (ref) => {
+    if (ref.current) {
+      try { URL.revokeObjectURL(ref.current); } catch {}
+      ref.current = null;
+    }
+  };
+
   const startGame = async () => {
+    // discard old audio URLs
+    revokeIfSet(origSrcRef);
+    revokeIfSet(eqSrcRef);
+
+    setHint("");
+    setAttempts(0);
+
     try {
-      setAttempts(0);
-      setHint("");
-      if (!audioRef.current) return;
+      const r = await fetch(`${API_BASE}/audio-bundle`);
+      if (!r.ok) throw new Error("bundle fail");
+      const data = await r.json();
 
-      const wasPlaying = !audioRef.current.paused && !audioRef.current.ended;
+      // build blob URLs
+      const origUrl = makeUrlFromB64(data.original.data, data.original.mime);
+      const eqUrl   = makeUrlFromB64(data.eq_version.data, data.eq_version.mime);
 
-      audioRef.current.src = buildStreamSrc({ eq: eqEnabled, randomize: true });
-      await once(audioRef.current, "loadedmetadata");
-      audioRef.current.currentTime = 0;
+      // store for hot-swap
+      origSrcRef.current = origUrl;
+      eqSrcRef.current = eqUrl;
 
-      if (wasPlaying || !isPlaying) {
-        await audioRef.current.play();
-        setIsPlaying(true);
+      // set active source based on current toggle
+      if (audioRef.current) {
+        const wasPlaying = isPlaying;
+        const t = audioRef.current.currentTime || 0;
+        audioRef.current.src = eqEnabled ? eqSrcRef.current : origSrcRef.current;
+        audioRef.current.currentTime = 0; // new game starts fresh
+        audioRef.current.load();
+        if (wasPlaying) {
+          try { await audioRef.current.play(); setIsPlaying(true); } catch {}
+        } else {
+          setIsPlaying(false);
+        }
       }
-    } catch {
-      setHint("Could not start audio.");
+    } catch (e) {
+      setHint("Failed to load audio bundle.");
     }
   };
 
-  // Toggle EQ without restarting: hit /toggle-eq and keep position
   const toggleEq = async () => {
-    if (!audioRef.current) return;
+    if (!audioRef.current || !origSrcRef.current || !eqSrcRef.current) return;
 
-    const next = !eqEnabled;
-    setEqEnabled(next);
+    const wasPlaying = !audioRef.current.paused;
+    const t = audioRef.current.currentTime || 0;
 
-    const wasPlaying = !audioRef.current.paused && !audioRef.current.ended;
-    const t = audioRef.current.currentTime;
+    // swap source without re-fetching
+    const nextEnabled = !eqEnabled;
+    setEqEnabled(nextEnabled);
 
-    // Server flips EQ state and returns audio bytes
-    audioRef.current.src = buildToggleSrc();
-    await once(audioRef.current, "loadedmetadata");
-    audioRef.current.currentTime = t;
+    audioRef.current.src = nextEnabled ? eqSrcRef.current : origSrcRef.current;
+    // try to keep position
+    try { audioRef.current.currentTime = t; } catch {}
+    audioRef.current.load();
+
     if (wasPlaying) {
-      try { await audioRef.current.play(); } catch {}
+      try { await audioRef.current.play(); setIsPlaying(true); } catch {}
     }
   };
 
-  // Guess via server
   const handleGuess = async (range) => {
     setAttempts((a) => a + 1);
     try {
@@ -93,11 +115,16 @@ function GuessNumberGame() {
       audioRef.current.pause();
       setIsPlaying(false);
     } else {
-      try { await audioRef.current.play(); setIsPlaying(true); } catch {}
+      try {
+        await audioRef.current.play();
+        setIsPlaying(true);
+      } catch {}
     }
   };
 
-  useEffect(() => { startGame(); }, []);
+  useEffect(() => {
+    startGame();
+  }, []);
 
   return (
     <div
@@ -105,7 +132,6 @@ function GuessNumberGame() {
         eqEnabled ? "bg-purple-950" : "bg-neutral-950"
       }`}
     >
-      {/* We programmatically set .src, so no <source> child */}
       <audio ref={audioRef} loop crossOrigin="anonymous" />
 
       <div className="w-full max-w-5xl rounded-2xl bg-neutral-900 p-10 shadow-2xl border border-neutral-800 flex flex-col items-center text-center">
