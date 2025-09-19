@@ -34,7 +34,7 @@ def _design_peaking_biquad(fs: float, f0: float, q: float, gain_db: float):
 
 def _load_audio_any(path: str):
     """
-    Load WAV/MP3 without ffmpeg usage in our code.
+    Load WAV/MP3
     librosa uses soundfile (libsndfile) when possible, otherwise audioread.
     Returns (y [np.float32, shape (n, ch)], sr, ch).
     """
