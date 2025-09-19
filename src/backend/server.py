@@ -55,9 +55,15 @@ def _b64(b: bytes) -> str:
     import base64
     return base64.b64encode(b).decode("ascii")
 
+
 # --------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------
+@app.get("/init")
+def init():
+    return jsonify({"ranges": RANGES})
+
+
 @app.get("/audio-bundle")
 def audio_bundle():
     """
@@ -117,42 +123,37 @@ def audio_bundle():
 @app.get("/guess")
 def handle_guess():
     """
-    Query params: ?min=<int>&max=<int>
+    Query: ?min=<int>&max=<int>
     Returns:
       {
-        "correct": true/false,
-        "relation": "higher" | "lower" | null
+        "correct": bool,
+        "relation": "higher" | "lower" | null,
+        "frequency_hz": float  # exact picked frequency
       }
-    - relation indicates where the true frequency lies relative to the GUESS RANGE
-      if incorrect (e.g., "higher" means target > max, "lower" means target < min).
-    - 404 if no active target (call /audio-bundle first).
     """
     target_hz, _range_idx = _get_target()
     if target_hz is None:
-        return jsonify({"error": "No active game; call /audio-bundle first."}), 404
+      return jsonify({"error": "No active game; call /audio-bundle first."}), 404
 
-    # validate inputs
     try:
-        min_q = int(request.args.get("min", "").strip())
-        max_q_raw = request.args.get("max", "").strip()
-        # allow open-ended "plus" ranges by treating missing/blank max as a cap
-        if max_q_raw == "" or max_q_raw is None:
-            max_q = 10_000  # generous ceiling for "4001+"
-        else:
-            max_q = int(max_q_raw)
+        min_q = int((request.args.get("min") or "").strip())
+        max_raw = (request.args.get("max") or "").strip()
+        max_q = int(max_raw) if max_raw != "" else 10_000  # open-ended caps
     except Exception:
         return jsonify({"error": "Bad query. Use ?min=<int>&max=<int>"}), 400
 
     if min_q > max_q:
-        min_q, max_q = max_q, min_q  # normalize just in case
+        min_q, max_q = max_q, min_q
 
     correct = (min_q <= target_hz <= max_q)
-    if correct:
-        relation = None
-    else:
-        relation = "lower" if target_hz < min_q else "higher"
+    relation = None if correct else ("lower" if target_hz < min_q else "higher")
 
-    return jsonify({"correct": correct, "relation": relation})
+    return jsonify({
+        "correct": correct,
+        "relation": relation,
+        "frequency_hz": round(float(target_hz), 2)
+    })
+
 
 
 if __name__ == "__main__":

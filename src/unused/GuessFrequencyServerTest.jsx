@@ -3,24 +3,16 @@ const { useEffect, useRef, useState } = React;
 function GuessNumberGame() {
   const API_BASE = "http://localhost:5000";
 
-  const ranges = [
-    { label: "20 – 120", min: 20, max: 120 },
-    { label: "121 – 500", min: 121, max: 500 },
-    { label: "501 – 800", min: 501, max: 800 },
-    { label: "801 – 4000", min: 801, max: 4000 },
-    { label: "4001+", min: 4001, max: 8000 },
-  ];
-
   const audioRef = useRef(null);
   const origSrcRef = useRef(null);
   const eqSrcRef = useRef(null);
 
+  const [ranges, setRanges] = useState([]);       // <- now from server
   const [isPlaying, setIsPlaying] = useState(false);
   const [eqEnabled, setEqEnabled] = useState(true);
   const [attempts, setAttempts] = useState(0);
   const [hint, setHint] = useState("");
 
-  
   const makeUrlFromB64 = (b64, mime) => {
     const bin = atob(b64);
     const len = bin.length;
@@ -36,8 +28,25 @@ function GuessNumberGame() {
     }
   };
 
+  // ---- NEW: init to fetch ranges first ----
+  const initGame = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/init`);
+      if (!r.ok) throw new Error("init fail");
+      const data = await r.json();
+      if (Array.isArray(data.ranges) && data.ranges.length) {
+        setRanges(data.ranges);
+      } else {
+        throw new Error("no ranges");
+      }
+      // after ranges are loaded, pull the first audio bundle
+      await startGame();
+    } catch (e) {
+      setHint("Failed to initialize game.");
+    }
+  };
+
   const startGame = async () => {
-    // discard old audio URLs
     revokeIfSet(origSrcRef);
     revokeIfSet(eqSrcRef);
 
@@ -49,20 +58,19 @@ function GuessNumberGame() {
       if (!r.ok) throw new Error("bundle fail");
       const data = await r.json();
 
-      // build blob URLs
+      // If server also returns ranges here, keep client in sync (optional)
+      if (Array.isArray(data.ranges) && data.ranges.length) setRanges(data.ranges);
+
       const origUrl = makeUrlFromB64(data.original.data, data.original.mime);
       const eqUrl   = makeUrlFromB64(data.eq_version.data, data.eq_version.mime);
 
-      // store for hot-swap
       origSrcRef.current = origUrl;
       eqSrcRef.current = eqUrl;
 
-      // set active source based on current toggle
       if (audioRef.current) {
         const wasPlaying = isPlaying;
-        const t = audioRef.current.currentTime || 0;
         audioRef.current.src = eqEnabled ? eqSrcRef.current : origSrcRef.current;
-        audioRef.current.currentTime = 0; // new game starts fresh
+        audioRef.current.currentTime = 0;
         audioRef.current.load();
         if (wasPlaying) {
           try { await audioRef.current.play(); setIsPlaying(true); } catch {}
@@ -81,12 +89,10 @@ function GuessNumberGame() {
     const wasPlaying = !audioRef.current.paused;
     const t = audioRef.current.currentTime || 0;
 
-    // swap source without re-fetching
     const nextEnabled = !eqEnabled;
     setEqEnabled(nextEnabled);
 
     audioRef.current.src = nextEnabled ? eqSrcRef.current : origSrcRef.current;
-    // try to keep position
     try { audioRef.current.currentTime = t; } catch {}
     audioRef.current.load();
 
@@ -98,12 +104,24 @@ function GuessNumberGame() {
   const handleGuess = async (range) => {
     setAttempts((a) => a + 1);
     try {
-      const q = new URLSearchParams({ min: range.min, max: range.max }).toString();
+      // allow open-ended ranges by sending blank max if it's undefined/null
+      const q = new URLSearchParams({
+        min: String(range.min),
+        max: range.max == null ? "" : String(range.max),
+      }).toString();
+
       const r = await fetch(`${API_BASE}/guess?${q}`);
       if (!r.ok) throw new Error();
       const data = await r.json();
-      if (data.correct) setHint("🎉 Correct!");
-      else setHint(`❌ Wrong. The frequency is ${data.relation}`);
+
+      const hz = Number(data.frequency_hz ?? NaN);
+      const hzTxt = isNaN(hz) ? "" : ` (${hz.toFixed(2)} Hz)`;
+
+      if (data.correct) {
+        setHint(`🎉 Correct!${hzTxt}`);
+      } else {
+        setHint(`❌ Wrong. The frequency is ${data.relation}`);
+      }
     } catch {
       setHint("Guess endpoint unavailable.");
     }
@@ -123,7 +141,7 @@ function GuessNumberGame() {
   };
 
   useEffect(() => {
-    startGame();
+    initGame(); // <-- start by fetching ranges
   }, []);
 
   return (
@@ -141,15 +159,19 @@ function GuessNumberGame() {
         </p>
 
         <div className="flex justify-between gap-4 mb-6 w-full">
-          {ranges.map((r, i) => (
-            <button
-              key={i}
-              onClick={() => handleGuess(r)}
-              className="flex-1 rounded-xl px-6 py-6 text-lg font-medium bg-indigo-600 hover:bg-indigo-500 active:scale-95 transition"
-            >
-              {r.label}
-            </button>
-          ))}
+          {ranges.length === 0 ? (
+            <div className="w-full text-center opacity-70">Loading ranges…</div>
+          ) : (
+            ranges.map((r, i) => (
+              <button
+                key={i}
+                onClick={() => handleGuess(r)}
+                className="flex-1 rounded-xl px-6 py-6 text-lg font-medium bg-indigo-600 hover:bg-indigo-500 active:scale-95 transition"
+              >
+                {r.label}
+              </button>
+            ))
+          )}
         </div>
 
         <div className="h-10 mb-6 text-xl font-medium">{hint && <span>{hint}</span>}</div>
@@ -158,12 +180,14 @@ function GuessNumberGame() {
           <button
             onClick={toggleEq}
             className="rounded-xl px-6 py-3 font-medium bg-purple-600 hover:bg-purple-500 active:scale-95 transition"
+            disabled={!origSrcRef.current || !eqSrcRef.current}
           >
-            {eqEnabled ? "Disable EQ (hot-swap)" : "Enable EQ (hot-swap)"}
+            {eqEnabled ? "Disable EQ" : "Enable EQ"}
           </button>
           <button
             onClick={startGame}
             className="rounded-xl px-6 py-3 font-medium bg-neutral-800 hover:bg-neutral-700 active:scale-95 transition"
+            disabled={ranges.length === 0}
           >
             New game
           </button>
